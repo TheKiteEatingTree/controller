@@ -1,3 +1,7 @@
+build
+Keyboards/otis.gcc
+.zedstate
+
 # Compiled source #
 ###################
 *.com
