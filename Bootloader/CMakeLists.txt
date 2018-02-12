@@ -82,17 +82,19 @@ include ( initialize )
 #
 set ( SRCS
 	main.c
+	debug.c
 	dfu.c
 	dfu.desc.c
 	flash.c
 	kinetis.c
 	usb.c
+	Devices/${CHIP}.c
 )
 
-# Only compile in if necessary
-if ( CHIP STREQUAL "mk20dx256vlh7" )
-	set( SRCS ${SRCS}
-		debug.c
+# Add device file, if it exists
+if ( EXISTS ${CMAKE_SOURCE_DIR}/Devices/${BOOT_PRODUCT_STR}.c )
+	set ( SRCS ${SRCS}
+		Devices/${BOOT_PRODUCT_STR}.c
 	)
 endif ()
 
@@ -177,7 +179,7 @@ find_package ( Ctags ) # Optional
 
 if ( CTAGS_EXECUTABLE )
 	# Generate the ctags
-	execute_process( COMMAND ctags ${SRCS}
+	execute_process( COMMAND ${CTAGS_EXECUTABLE} ${SRCS}
 		WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 	)
 endif ()

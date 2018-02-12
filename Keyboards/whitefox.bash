@@ -6,6 +6,12 @@
 # Jacob Alexander 2015-2017
 
 
+# Default to TrueFox
+Layout=$(basename $0 | cut -d'.' -f2)
+if [ "${Layout}" = "bash" ]; then
+	Layout=truefox
+fi
+
 
 #################
 # Configuration #
@@ -15,15 +21,18 @@
 
 BuildPath="WhiteFox"
 
+# Define Layout Name
+LayoutName=${Layout}
+
 ## KLL Configuration ##
 
 # Generally shouldn't be changed, this will affect every layer
-BaseMap="scancode_map scancode_map.truefox"
+BaseMap="scancode_map scancode_map.${Layout}"
 
 # This is the default layer of the keyboard
 # NOTE: To combine kll files into a single layout, separate them by spaces
 # e.g.  DefaultMap="mylayout mylayoutmod"
-DefaultMap="customFox"
+DefaultMap="whitefox/all-leds stdFuncMap customFox"
 
 # This is where you set the additional layers
 # NOTE: Indexing starts at 1
@@ -47,7 +56,7 @@ PartialMaps[2]="customFox2"
 # Keyboard Module Configuration
 ScanModule="WhiteFox"
 MacroModule="PixelMap"
-OutputModule="pjrcUSB"
+OutputModule="USB"
 DebugModule="full"
 
 # Microcontroller
@@ -65,11 +74,11 @@ Compiler="gcc"
 # Shouldn't need to touch this section
 
 # Check if the library can be found
-if [ ! -f cmake.bash ]; then
+if [ ! -f "${BASH_SOURCE%/*}/cmake.bash" ]; then
 	echo "ERROR: Cannot find 'cmake.bash'"
 	exit 1
 fi
 
 # Load the library
-source cmake.bash
+source "${BASH_SOURCE%/*}/cmake.bash"
 

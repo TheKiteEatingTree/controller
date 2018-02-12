@@ -3,7 +3,15 @@
 # Keyboard: Infinity 60% (MD1)
 #
 # These build scripts are just a convenience for configuring your keyboard (less daunting than CMake)
-# Jacob Alexander 2015-2016
+# Jacob Alexander 2015-2017
+
+
+
+# Default to Alphabet
+Layout=$(basename $0 | cut -d'.' -f2)
+if [ "${Layout}" = "bash" ]; then
+	Layout=alphabet
+fi
 
 
 
@@ -15,10 +23,13 @@
 
 BuildPath="IC60"
 
+# Define Layout Name
+LayoutName=${Layout}
+
 ## KLL Configuration ##
 
 # Generally shouldn't be changed, this will affect every layer
-BaseMap="scancode_map"
+BaseMap="scancode_map scancode_map.${Layout}"
 
 # This is the default layer of the keyboard
 # NOTE: To combine kll files into a single layout, separate them by spaces
@@ -31,7 +42,7 @@ DefaultMap="stdFuncMap"
 # e.g.  PartialMaps[1]="layer1 layer1mod"
 #       PartialMaps[2]="layer2"
 #       PartialMaps[3]="layer3"
-PartialMaps[1]="hhkbpro2"
+PartialMaps[1]="ic60/hhkbpro2"
 
 
 
@@ -46,7 +57,7 @@ PartialMaps[1]="hhkbpro2"
 # Keyboard Module Configuration
 ScanModule="Infinity_60"
 MacroModule="PartialMap"
-OutputModule="pjrcUSB"
+OutputModule="USB"
 DebugModule="full"
 
 # Microcontroller
@@ -64,11 +75,11 @@ Compiler="gcc"
 # Shouldn't need to touch this section
 
 # Check if the library can be found
-if [ ! -f cmake.bash ]; then
+if [ ! -f "${BASH_SOURCE%/*}/cmake.bash" ]; then
 	echo "ERROR: Cannot find 'cmake.bash'"
 	exit 1
 fi
 
 # Load the library
-source cmake.bash
+source "${BASH_SOURCE%/*}/cmake.bash"
 

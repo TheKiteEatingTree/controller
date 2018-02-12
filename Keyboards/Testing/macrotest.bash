@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # This is a build and test script used to test KLL functionality
 # It runs on the host system and doesn't require a device to flash onto
-# Jacob Alexander 2016
+# Jacob Alexander 2016-2018
 
 
 
@@ -29,7 +29,7 @@ DefaultMap="animation_test stdFuncMap"
 # e.g.  PartialMaps[1]="layer1 layer1mod"
 #       PartialMaps[2]="layer2"
 #       PartialMaps[3]="layer3"
-PartialMaps[1]="hhkbpro2"
+PartialMaps[1]="ic60/hhkbpro2"
 PartialMaps[2]="colemak"
 
 
@@ -81,8 +81,15 @@ source "../common.bash"
 # Run tests
 cd "${BuildPath}"
 
+# Not Supported on Cygwin
+if [[ $(uname -s) == MINGW32_NT* ]] || [[ $(uname -s) == CYGWIN* ]]; then
+	echo "macrotest.bash is unsupported on Cygwin. As are any host-side kll tests."
+	exit 0
+fi
+
 cmd python3 Tests/test.py
 cmd python3 Tests/animation.py
+cmd python3 Tests/hidio.py
 
 # Tally results
 result

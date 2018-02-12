@@ -1,4 +1,4 @@
-/* Copyright (C) 2014-2017 by Jacob Alexander
+/* Copyright (C) 2014-2018 by Jacob Alexander
  *
  * This file is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -21,6 +21,7 @@
 
 // Project Includes
 #include <cli.h>
+#include <latency.h>
 #include <led.h>
 #include <print.h>
 #include <scan_loop.h>
@@ -62,6 +63,7 @@ void cliFunc_macroProc ( char* args );
 void cliFunc_macroShow ( char* args );
 void cliFunc_macroStep ( char* args );
 void cliFunc_posList   ( char* args );
+void cliFunc_voteDebug ( char* args );
 
 
 
@@ -82,6 +84,7 @@ CLIDict_Entry( macroProc,   "Pause/Resume macro processing." );
 CLIDict_Entry( macroShow,   "Show the macro corresponding to the given index." NL "\t\t\033[35mT16\033[0m Indexed Trigger Macro 0x10, \033[35mR12\033[0m Indexed Result Macro 0x0C" );
 CLIDict_Entry( macroStep,   "Do N macro processing steps. Defaults to 1." );
 CLIDict_Entry( posList,     "List physical key positions by ScanCode." );
+CLIDict_Entry( voteDebug,   "Show results of TriggerEvent voting." );
 
 CLIDict_Def( macroCLIDict, "Macro Module Commands" ) = {
 	CLIDict_Item( capList ),
@@ -98,28 +101,41 @@ CLIDict_Def( macroCLIDict, "Macro Module Commands" ) = {
 	CLIDict_Item( macroShow ),
 	CLIDict_Item( macroStep ),
 	CLIDict_Item( posList ),
+	CLIDict_Item( voteDebug ),
 	{ 0, 0, 0 } // Null entry for dictionary end
 };
 
 
 // Layer debug flag - If set, displays any changes to layers and the full layer stack on change
-uint8_t layerDebugMode = 0;
+uint8_t layerDebugMode;
 
 // Macro debug flag - If set, clears the USB Buffers after signalling processing completion
-uint8_t macroDebugMode = 0;
+// 1 - Disable USB output, show debug
+// 2 - Enabled USB output, show debug
+// 3 - Disable USB output
+uint8_t macroDebugMode;
+
+// Vote debug flag - If set show the result of each
+uint8_t voteDebugMode;
+
+// Trigger pending debug flag - If set show pending triggers before evaluating
+uint8_t triggerPendingDebugMode;
 
 // Macro pause flag - If set, the macro module pauses processing, unless unset, or the step counter is non-zero
-uint8_t macroPauseMode = 0;
+uint8_t macroPauseMode;
 
 // Macro step counter - If non-zero, the step counter counts down every time the macro module does one processing loop
-uint16_t macroStepCounter = 0;
+uint16_t macroStepCounter;
 
 
-// Key Trigger List Buffer and Layer Cache
-// The layer cache is set on press only, hold and release events refer to the value set on press
-TriggerGuide macroTriggerListBuffer[ MaxScanCode ];
-var_uint_t macroTriggerListBufferSize = 0;
-var_uint_t macroTriggerListLayerCache[ MaxScanCode ];
+// Latency resource
+static uint8_t macroLatencyResource;
+
+
+// Incoming Trigger Event Buffer
+TriggerEvent macroTriggerEventBuffer[ MaxScanCode + 1 ];
+var_uint_t macroTriggerEventBufferSize;
+var_uint_t macroTriggerEventLayerCache[ MaxScanCode + 1 ];
 
 // Layer Index Stack
 //  * When modifying layer state and the state is non-0x0, the stack must be adjusted
@@ -134,17 +150,20 @@ extern index_uint_t macroTriggerMacroPendingListSize;
 // Interconnect ScanCode Cache
 #if defined(ConnectEnabled_define) || defined(PressReleaseCache_define)
 // TODO This can be shrunk by the size of the max node 0 ScanCode
-TriggerGuide macroInterconnectCache[ MaxScanCode ];
+TriggerEvent macroInterconnectCache[ MaxScanCode + 1 ];
 uint8_t macroInterconnectCacheSize = 0;
+#endif
+
+// Dynamically Sized Type Widths
+#if defined(_host_)
+const uint8_t StateWordSize = StateWordSize_define;
+const uint8_t IndexWordSize = IndexWordSize_define;
+const uint8_t ScheduleStateSize = ScheduleStateSize_define;
 #endif
 
 
 
 // ----- Capabilities -----
-
-#if defined(Pixel_MapEnabled_define) && defined(animation_test_layout_define)
-uint8_t Pixel_addDefaultAnimation( uint32_t index );
-#endif
 
 // Sets the given layer with the specified layerState
 void Macro_layerState( TriggerMacro *trigger, uint8_t state, uint8_t stateType, uint16_t layer, uint8_t layerState )
@@ -152,12 +171,6 @@ void Macro_layerState( TriggerMacro *trigger, uint8_t state, uint8_t stateType, 
 	// Ignore if layer does not exist or trying to manipulate layer 0/Default layer
 	if ( layer >= LayerNum || layer == 0 )
 		return;
-
-#if defined(Pixel_MapEnabled_define) && defined(animation_test_layout_define)
-	// TODO TODO TODO TODO
-	// TODO (HaaTa) Add as an event
-	Pixel_addDefaultAnimation( Animation__lock_event );
-#endif
 
 	// Is layer in the LayerIndexStack?
 	uint8_t inLayerIndexStack = 0;
@@ -211,7 +224,7 @@ void Macro_layerState( TriggerMacro *trigger, uint8_t state, uint8_t stateType, 
 	// Layer Debug Mode
 	if ( layerDebugMode )
 	{
-		dbug_msg("Layer ");
+		print("\033[1;36mL\033[0m ");
 
 		// Iterate over each of the layers displaying the state as a hex value
 		for ( index_uint_t index = 0; index < LayerNum; index++ )
@@ -396,27 +409,203 @@ void Macro_layerRotate_capability( TriggerMacro *trigger, uint8_t state, uint8_t
 
 
 
+// ----- Debug Functions -----
+
+// Shows a ScheduleType
+void Macro_showScheduleType( ScheduleState state )
+{
+	// State types
+	switch ( state )
+	{
+	case ScheduleType_P:
+	//case ScheduleType_A:
+		print("\033[1;33mP\033[0m");
+		break;
+
+	case ScheduleType_H:
+	//case ScheduleType_On:
+		print("\033[1;32mH\033[0m");
+		break;
+
+	case ScheduleType_R:
+	//case ScheduleType_D:
+		print("\033[1;35mR\033[0m");
+		break;
+
+	case ScheduleType_O:
+	//case ScheduleType_Off:
+		print("\033[1mO\033[0m");
+		break;
+
+	case ScheduleType_UP:
+		print("UP");
+		break;
+
+	case ScheduleType_UR:
+		print("UR");
+		break;
+
+	case ScheduleType_Done:
+		print("Done");
+		break;
+
+	case ScheduleType_Repeat:
+		print("Repeat");
+		break;
+
+	case ScheduleType_Debug:
+		print("Debug");
+		break;
+
+	default:
+		print("\033[1;31mINVALID\033[0m");
+		break;
+	}
+}
+
+// Shows a ScheduleParam
+void Macro_showScheduleParam( ScheduleParam *param, uint8_t analog )
+{
+	// Analog
+	if ( analog )
+	{
+		printInt8( param->analog );
+	}
+	// Everything else
+	else
+	{
+		Macro_showScheduleType( param->state );
+	}
+
+	// Time
+	print(":");
+	printInt32( param->time.ms );
+	print(".");
+	printInt32( param->time.ticks );
+}
+
+// Shows a Schedule
+void Macro_showSchedule( Schedule *schedule, uint8_t analog )
+{
+	// Show first element
+	Macro_showScheduleParam( &schedule->params[0], analog );
+
+	// Iterate over each additional parameter of the schedule
+	for ( uint8_t c = 1; c < schedule->count; c++ )
+	{
+		print(",");
+		Macro_showScheduleParam( &schedule->params[c], analog );
+	}
+}
+
+// Shows a TriggerType
+void Macro_showTriggerType( TriggerType type )
+{
+	// Type
+	switch ( type )
+	{
+	// Switches
+	case TriggerType_Switch1:
+	case TriggerType_Switch2:
+	case TriggerType_Switch3:
+	case TriggerType_Switch4:
+		print("Sw");
+		break;
+
+	// LEDs
+	case TriggerType_LED1:
+		print("LED");
+		break;
+
+	// Analog
+	case TriggerType_Analog1:
+	case TriggerType_Analog2:
+	case TriggerType_Analog3:
+	case TriggerType_Analog4:
+		print("An");
+		break;
+
+	// Layer
+	case TriggerType_Layer1:
+	case TriggerType_Layer2:
+	case TriggerType_Layer3:
+	case TriggerType_Layer4:
+		print("Layer");
+		break;
+
+	// Invalid
+	default:
+		print("INVALID");
+		break;
+
+	// Debug
+	case TriggerType_Debug:
+		print("Debug");
+		break;
+	}
+}
+
+// Shows a TriggerEvent
+void Macro_showTriggerEvent( TriggerEvent *event )
+{
+	// Decode type
+	Macro_showTriggerType( event->type );
+	print(" ");
+
+	// Show state
+	Macro_showScheduleType( event->state );
+	print(" ");
+
+	// Show index number
+	printInt8( event->type );
+	print(":");
+	printInt8( event->index );
+}
+
+// Shows a TriggerGuide
+void Macro_showTriggerGuide( TriggerGuide *guide )
+{
+}
+
+
+
 // ----- Functions -----
+
+#if defined(_host_)
+// Callback for host-side kll
+extern int Output_callback( char* command, char* args );
+const uint32_t LayerNum_host = LayerNum;
+#endif
+
+// Clears the current layer state
+void Macro_clearLayers()
+{
+	// Clear layer stack
+	macroLayerIndexStackSize = 0;
+
+	// Clear layer states
+	memset( &LayerState, 0, sizeof(LayerStateType) * LayerNum );
+}
 
 // Looks up the trigger list for the given scan code (from the active layer)
 // NOTE: Calling function must handle the NULL pointer case
-nat_ptr_t *Macro_layerLookup( TriggerGuide *guide, uint8_t latch_expire )
+nat_ptr_t *Macro_layerLookup( TriggerEvent *event, uint8_t latch_expire )
 {
-	uint8_t scanCode = guide->scanCode;
+	uint8_t index = event->index;
 
-	// TODO Analog
+	// TODO Analog, LED, Layer, Animation
 	// If a normal key, and not pressed, do a layer cache lookup
-	if ( guide->type == 0x00 && guide->state != 0x01 )
+	if ( event->type == 0x00 && event->state != 0x01 )
 	{
 		// Cached layer
-		var_uint_t cachedLayer = macroTriggerListLayerCache[ scanCode ];
+		var_uint_t cachedLayer = macroTriggerEventLayerCache[ index ];
 
 		// Lookup map, then layer
 		nat_ptr_t **map = (nat_ptr_t**)LayerIndex[ cachedLayer ].triggerMap;
 		const Layer *layer = &LayerIndex[ cachedLayer ];
 
 		// Cache trigger list before attempting to expire latch
-		nat_ptr_t *trigger_list = map[ scanCode - layer->first ];
+		nat_ptr_t *trigger_list = map[ index - layer->first ];
 
 		// Check if latch has been pressed for this layer
 		uint8_t latch = LayerState[ cachedLayer ] & 0x02;
@@ -461,16 +650,16 @@ nat_ptr_t *Macro_layerLookup( TriggerGuide *guide, uint8_t latch_expire )
 			nat_ptr_t **map = (nat_ptr_t**)layer->triggerMap;
 
 			// Determine if layer has key defined
-			// Make sure scanCode is between layer first and last scancodes
+			// Make sure index is between layer first and last scancodes
 			if ( map != 0
-				&& scanCode <= layer->last
-				&& scanCode >= layer->first
-				&& *map[ scanCode - layer->first ] != 0 )
+				&& index <= layer->last
+				&& index >= layer->first
+				&& *map[ index - layer->first ] != 0 )
 			{
 				// Set the layer cache
-				macroTriggerListLayerCache[ scanCode ] = macroLayerIndexStack[ layerIndex ];
+				macroTriggerEventLayerCache[ index ] = macroLayerIndexStack[ layerIndex ];
 
-				return map[ scanCode - layer->first ];
+				return map[ index - layer->first ];
 			}
 		}
 	}
@@ -481,21 +670,21 @@ nat_ptr_t *Macro_layerLookup( TriggerGuide *guide, uint8_t latch_expire )
 	// Lookup default layer
 	const Layer *layer = &LayerIndex[0];
 
-	// Make sure scanCode is between layer first and last scancodes
+	// Make sure index is between layer first and last scancodes
 	if ( map != 0
-		&& scanCode <= layer->last
-		&& scanCode >= layer->first
-		&& *map[ scanCode - layer->first ] != 0 )
+		&& index <= layer->last
+		&& index >= layer->first
+		&& *map[ index - layer->first ] != 0 )
 	{
 		// Set the layer cache to default map
-		macroTriggerListLayerCache[ scanCode ] = 0;
+		macroTriggerEventLayerCache[ index ] = 0;
 
-		return map[ scanCode - layer->first ];
+		return map[ index - layer->first ];
 	}
 
 	// Otherwise no defined Trigger Macro
-	erro_msg("Scan Code has no defined Trigger Macro: ");
-	printHex( scanCode );
+	erro_msg("Index has no defined Trigger Macro: ");
+	printHex( index );
 	print( NL );
 	return 0;
 }
@@ -508,7 +697,7 @@ nat_ptr_t *Macro_layerLookup( TriggerGuide *guide, uint8_t latch_expire )
 #if defined(ConnectEnabled_define) || defined(PressReleaseCache_define)
 uint8_t Macro_pressReleaseAdd( void *trigger_ptr )
 {
-	TriggerGuide *trigger = (TriggerGuide*)trigger_ptr;
+	TriggerEvent *trigger = (TriggerEvent*)trigger_ptr;
 
 	// Error checking
 	uint8_t error = 0;
@@ -537,7 +726,7 @@ uint8_t Macro_pressReleaseAdd( void *trigger_ptr )
 	}
 
 	// Check if ScanCode is out of range
-	if ( trigger->scanCode > MaxScanCode )
+	if ( trigger->index > MaxScanCode )
 	{
 		warn_msg("ScanCode is out of range/not defined - ");
 		error = 1;
@@ -550,7 +739,7 @@ uint8_t Macro_pressReleaseAdd( void *trigger_ptr )
 		print(" ");
 		printHex( trigger->state );
 		print(" ");
-		printHex( trigger->scanCode );
+		printHex( trigger->index );
 		print( NL );
 		return 2;
 	}
@@ -560,7 +749,7 @@ uint8_t Macro_pressReleaseAdd( void *trigger_ptr )
 	for ( var_uint_t c = 0; c < macroInterconnectCacheSize; c++ )
 	{
 		// Check if the same ScanCode
-		if ( macroInterconnectCache[ c ].scanCode == trigger->scanCode )
+		if ( macroInterconnectCache[ c ].index == trigger->index )
 		{
 			// Update the state
 			macroInterconnectCache[ c ].state = trigger->state;
@@ -583,7 +772,7 @@ uint8_t Macro_pressReleaseAdd( void *trigger_ptr )
 //   * 0x02 - Held
 //   * 0x03 - Released
 //   * 0x04 - Unpressed (this is currently ignored)
-inline void Macro_keyState( uint8_t scanCode, uint8_t state )
+void Macro_keyState( uint16_t scanCode, uint8_t state )
 {
 #if defined(ConnectEnabled_define)
 	// Only compile in if a Connect node module is available
@@ -592,32 +781,57 @@ inline void Macro_keyState( uint8_t scanCode, uint8_t state )
 		// ScanCodes are only added if there was a state change (on/off)
 		switch ( state )
 		{
-		case 0x00: // Off
-		case 0x02: // Held
+		case ScheduleType_O: // Off
+		case ScheduleType_H: // Held
 			return;
 		}
 	}
 #endif
 
+	// Lookup done based on size of scanCode
+	uint8_t index = 0;
+	TriggerType type = TriggerType_Switch1;
+
 	// Only add to macro trigger list if one of three states
 	switch ( state )
 	{
-	case 0x01: // Pressed
-	case 0x02: // Held
-	case 0x03: // Released
+	case ScheduleType_P: // Pressed
+	case ScheduleType_H: // Held
+	case ScheduleType_R: // Released
 		// Check if ScanCode is out of range
 		if ( scanCode > MaxScanCode )
 		{
 			warn_msg("ScanCode is out of range/not defined: ");
-			printHex( scanCode );
+			printInt16( scanCode );
 			print( NL );
 			return;
 		}
 
-		macroTriggerListBuffer[ macroTriggerListBufferSize ].scanCode = scanCode;
-		macroTriggerListBuffer[ macroTriggerListBufferSize ].state    = state;
-		macroTriggerListBuffer[ macroTriggerListBufferSize ].type     = 0x00; // Normal key
-		macroTriggerListBufferSize++;
+		// Determine which type
+		if ( scanCode < 256 )
+		{
+			index = scanCode;
+		}
+		else if ( scanCode < 512 )
+		{
+			index = scanCode - 256;
+			type = TriggerType_Switch2;
+		}
+		else if ( scanCode < 768 )
+		{
+			index = scanCode - 512;
+			type = TriggerType_Switch3;
+		}
+		else if ( scanCode < 1024 )
+		{
+			index = scanCode - 768;
+			type = TriggerType_Switch4;
+		}
+
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].index = index;
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].state = state;
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].type  = type;
+		macroTriggerEventBufferSize++;
 		break;
 	}
 }
@@ -628,48 +842,192 @@ inline void Macro_keyState( uint8_t scanCode, uint8_t state )
 //   * 0x00      - Off
 //   * 0x01      - Released
 //   * 0x02-0xFF - Analog value (low to high)
-inline void Macro_analogState( uint8_t scanCode, uint8_t state )
+void Macro_analogState( uint16_t scanCode, uint8_t state )
 {
 	// Only add to macro trigger list if non-off
-	// TODO Handle change for interconnect
-	if ( state != 0x00 )
-	{
-		// Check if ScanCode is out of range
-		if ( scanCode > MaxScanCode )
-		{
-			warn_msg("ScanCode is out of range/not defined: ");
-			printHex( scanCode );
-			print( NL );
-			return;
-		}
+	if ( state == 0x00 )
+		return;
 
-		macroTriggerListBuffer[ macroTriggerListBufferSize ].scanCode = scanCode;
-		macroTriggerListBuffer[ macroTriggerListBufferSize ].state    = state;
-		macroTriggerListBuffer[ macroTriggerListBufferSize ].type     = 0x02; // Analog key
-		macroTriggerListBufferSize++;
+	// Lookup done based on size of scanCode
+	uint8_t index = 0;
+	TriggerType type = TriggerType_Analog1;
+
+	// Determine which type
+	if ( scanCode < 256 )
+	{
+		index = scanCode;
 	}
+	else if ( scanCode < 512 )
+	{
+		index = scanCode - 256;
+		type = TriggerType_Analog2;
+	}
+	else if ( scanCode < 768 )
+	{
+		index = scanCode - 512;
+		type = TriggerType_Analog3;
+	}
+	else if ( scanCode < 1024 )
+	{
+		index = scanCode - 768;
+		type = TriggerType_Analog4;
+	}
+
+	macroTriggerEventBuffer[ macroTriggerEventBufferSize ].index = index;
+	macroTriggerEventBuffer[ macroTriggerEventBufferSize ].state = state;
+	macroTriggerEventBuffer[ macroTriggerEventBufferSize ].type  = type;
+	macroTriggerEventBufferSize++;
 }
 
 
 // Update led state
 // States:
 //   * 0x00 - Off
-//   * 0x01 - On
-inline void Macro_ledState( uint8_t ledCode, uint8_t state )
+//   * 0x01 - Activate
+//   * 0x02 - On
+//   * 0x03 - Deactivate
+void Macro_ledState( uint16_t ledCode, uint8_t state )
 {
-	// Only add to macro trigger list if non-off
 	// TODO Handle change for interconnect
-	if ( state != 0x00 )
-	{
-		// Check if LedCode is out of range
-		// TODO
 
-		macroTriggerListBuffer[ macroTriggerListBufferSize ].scanCode = ledCode;
-		macroTriggerListBuffer[ macroTriggerListBufferSize ].state    = state;
-		macroTriggerListBuffer[ macroTriggerListBufferSize ].type     = 0x01; // LED key
-		macroTriggerListBufferSize++;
+	// Lookup done based on size of scanCode
+	uint8_t index = ledCode;
+	TriggerType type = TriggerType_LED1;
+
+	// Only add to macro trigger list if one of three states
+	switch ( state )
+	{
+	case ScheduleType_A:  // Activate
+	case ScheduleType_On: // On
+	case ScheduleType_D:  // Deactivate
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].index = index;
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].state = state;
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].type  = type;
+		macroTriggerEventBufferSize++;
+		break;
 	}
 }
+
+
+// Update animation state
+// States:
+//   * 0x00 - Off
+//   * 0x06 - Done
+//   * 0x07 - Repeat
+void Macro_animationState( uint16_t animationIndex, uint8_t state )
+{
+	// TODO Handle change for interconnect
+
+	// Lookup done based on size of layerIndex
+	uint8_t index = 0;
+	TriggerType type = TriggerType_Animation1;
+
+	// Only add to macro trigger list if one of three states
+	switch ( state )
+	{
+	case ScheduleType_Done:   // Activate
+	case ScheduleType_Repeat: // On
+		// Check if layer is out of range
+		// TODO check total animatinos
+		/*
+		if ( animationIndex > AnimationNum_KLL )
+		{
+			warn_msg("AnimationIndex is out of range/not defined: ");
+			printInt16( animationIndex );
+			print( NL );
+			return;
+		}
+		*/
+
+		// Determine which type
+		if ( animationIndex < 256 )
+		{
+			index = animationIndex;
+		}
+		else if ( animationIndex < 512 )
+		{
+			index = animationIndex - 256;
+			type = TriggerType_Animation2;
+		}
+		else if ( animationIndex < 768 )
+		{
+			index = animationIndex - 512;
+			type = TriggerType_Animation3;
+		}
+		else if ( animationIndex < 1024 )
+		{
+			index = animationIndex - 768;
+			type = TriggerType_Animation4;
+		}
+
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].index = index;
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].state = state;
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].type  = type;
+		macroTriggerEventBufferSize++;
+		break;
+	}
+}
+
+
+/* TODO Merge with Macro_layerState
+// Update layer state
+// States:
+//   * 0x00 - Off
+//   * 0x01 - Activate
+//   * 0x02 - On
+//   * 0x03 - Deactivate
+void Macro_layerState( uint16_t layerIndex, uint8_t state )
+{
+	// TODO Handle change for interconnect
+
+	// Lookup done based on size of layerIndex
+	uint8_t index = 0;
+	TriggerType type = TriggerType_Layer1;
+
+	// Only add to macro trigger list if one of three states
+	switch ( state )
+	{
+	case ScheduleType_A:  // Activate
+	case ScheduleType_On: // On
+	case ScheduleType_D:  // Deactivate
+		// Check if layer is out of range
+		if ( layerIndex > LayerNum_KLL )
+		{
+			warn_msg("LayerIndex is out of range/not defined: ");
+			printInt16( layerIndex );
+			print( NL );
+			return;
+		}
+
+		// Determine which type
+		if ( layerIndex < 256 )
+		{
+			index = layerIndex;
+		}
+		else if ( layerIndex < 512 )
+		{
+			index = layerIndex - 256;
+			type = TriggerType_Layer2;
+		}
+		else if ( layerIndex < 768 )
+		{
+			index = layerIndex - 512;
+			type = TriggerType_Layer3;
+		}
+		else if ( layerIndex < 1024 )
+		{
+			index = layerIndex - 768;
+			type = TriggerType_Layer4;
+		}
+
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].index = index;
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].state = state;
+		macroTriggerEventBuffer[ macroTriggerEventBufferSize ].type  = type;
+		macroTriggerEventBufferSize++;
+		break;
+	}
+}
+*/
 
 
 // Append result macro to pending list, checking for duplicates
@@ -702,33 +1060,46 @@ void Macro_appendResultMacroToPendingList( const TriggerMacro *triggerMacro )
 	uint8_t scanCode = ((TriggerGuide*)&triggerMacro->guide[ pos - TriggerGuideSize ])->scanCode;
 
 	// Lookup scanCode in buffer list for the current state and stateType
-	for ( var_uint_t keyIndex = 0; keyIndex < macroTriggerListBufferSize; keyIndex++ )
+	for ( var_uint_t keyIndex = 0; keyIndex < macroTriggerEventBufferSize; keyIndex++ )
 	{
-		if ( macroTriggerListBuffer[ keyIndex ].scanCode == scanCode )
+		if ( macroTriggerEventBuffer[ keyIndex ].index == scanCode )
 		{
-			ResultMacroRecordList[ resultMacroIndex ].state     = macroTriggerListBuffer[ keyIndex ].state;
-			ResultMacroRecordList[ resultMacroIndex ].stateType = macroTriggerListBuffer[ keyIndex ].type;
+			ResultMacroRecordList[ resultMacroIndex ].state     = macroTriggerEventBuffer[ keyIndex ].state;
+			ResultMacroRecordList[ resultMacroIndex ].stateType = macroTriggerEventBuffer[ keyIndex ].type;
 		}
 	}
 
 	// Reset the macro position
+	ResultMacroRecordList[ resultMacroIndex ].prevPos = 0;
 	ResultMacroRecordList[ resultMacroIndex ].pos = 0;
 }
 
 
-// Macro Procesing Loop
-// Called once per USB buffer send
-inline void Macro_process()
+// Macro Processing Loop, called often
+// Generally takes care of thread-unsafe calls to capabilities that must be synchronized
+void Macro_poll()
 {
+	// Process delayed capabilities
+	Result_process_delayed();
+}
+
+
+// Macro Processing Loop, called from the periodic execution thread
+// Called once per USB buffer send
+void Macro_periodic()
+{
+	// Latency measurement
+	Latency_start_time( macroLatencyResource );
+
 #if defined(ConnectEnabled_define)
 	// Only compile in if a Connect node module is available
 	// If this is a interconnect slave node, send all scancodes to master node
 	if ( !Connect_master )
 	{
-		if ( macroTriggerListBufferSize > 0 )
+		if ( macroTriggerEventBufferSize > 0 )
 		{
-			Connect_send_ScanCode( Connect_id, macroTriggerListBuffer, macroTriggerListBufferSize );
-			macroTriggerListBufferSize = 0;
+			Connect_send_ScanCode( Connect_id, macroTriggerEventBuffer, macroTriggerEventBufferSize );
+			macroTriggerEventBufferSize = 0;
 		}
 		return;
 	}
@@ -746,30 +1117,77 @@ inline void Macro_process()
 		for ( uint8_t c = 0; c < currentInterconnectCacheSize; c++ )
 		{
 			// Add to the trigger list
-			macroTriggerListBuffer[ macroTriggerListBufferSize++ ] = macroInterconnectCache[ c ];
+			macroTriggerEventBuffer[ macroTriggerEventBufferSize++ ] = macroInterconnectCache[ c ];
 
 			// TODO Handle other TriggerGuide types (e.g. analog)
 			switch ( macroInterconnectCache[ c ].type )
 			{
 			// Normal (Press/Hold/Release)
-			case 0x00:
+			case TriggerType_Switch1:
 				// Decide what to do based on the current state
 				switch ( macroInterconnectCache[ c ].state )
 				{
 				// Re-add to interconnect cache in hold state
-				case 0x01: // Press
-				//case 0x02: // Hold // XXX Why does this not work? -HaaTa
+				case ScheduleType_P: // Press
+				//case ScheduleType_H: // Hold // XXX Why does this not work? -HaaTa
 					macroInterconnectCache[ c ].state = 0x02;
 					macroInterconnectCache[ macroInterconnectCacheSize++ ] = macroInterconnectCache[ c ];
 					break;
-				case 0x03: // Remove
+
+				case ScheduleType_R: // Release
 					break;
+
 				// Otherwise, do not re-add
+				default:
+					break;
 				}
+				break;
+
+			// Not implemented
+			default:
+				erro_msg("Interconnect Trigger Event Type - Not Implemented ");
+				printInt8( macroInterconnectCache[ c ].type );
+				print( NL );
+				break;
 			}
 		}
 	}
 #endif
+	// Macro incoming state debug
+	switch ( macroDebugMode )
+	{
+	case 1:
+	case 2:
+		// Iterate over incoming triggers
+		for ( uint16_t trigger = 0; trigger < macroTriggerEventBufferSize; trigger++ )
+		{
+			// Show debug info about incoming trigger
+			Macro_showTriggerEvent( &macroTriggerEventBuffer[trigger] );
+			print( NL );
+		}
+
+	case 3:
+	default:
+		break;
+	}
+
+	// Check macroTriggerEventBufferSize to make sure no overflow
+	if ( macroTriggerEventBufferSize >= MaxScanCode )
+	{
+		// No scancodes defined
+		if ( MaxScanCode == 0 )
+		{
+			warn_print("No scancodes defined! Check your BaseMap!");
+		}
+		// Bug!
+		else
+		{
+			erro_msg("Macro Trigger Event Overflow! Serious Bug! ");
+			printInt16( macroTriggerEventBufferSize );
+			print( NL );
+			macroTriggerEventBufferSize = 0;
+		}
+	}
 
 	// If the pause flag is set, only process if the step counter is non-zero
 	if ( macroPauseMode )
@@ -790,17 +1208,26 @@ inline void Macro_process()
 	Result_process();
 
 	// Signal buffer that we've used it
-	Scan_finishedWithMacro( macroTriggerListBufferSize );
+	Scan_finishedWithMacro( macroTriggerEventBufferSize );
 
 	// Reset TriggerList buffer
-	macroTriggerListBufferSize = 0;
+	macroTriggerEventBufferSize = 0;
+
+#if defined(_host_)
+	// Signal host to read layer state
+	Output_callback( "layerState", "" );
+#endif
+
+	// Latency measurement
+	Latency_end_time( macroLatencyResource );
 
 	// If Macro debug mode is set, clear the USB Buffer
-	if ( macroDebugMode )
+#if defined(Output_USBEnabled_define)
+	if ( macroDebugMode == 1 || macroDebugMode == 3 )
 	{
-		USBKeys_Modifiers = 0;
-		USBKeys_Sent = 0;
+		USBKeys_primary.changed = 0;
 	}
+#endif
 }
 
 
@@ -818,17 +1245,29 @@ inline void Macro_setup()
 	// Set Macro step counter to zero
 	macroStepCounter = 0;
 
-	// Make sure macro trigger buffer is empty
-	macroTriggerListBufferSize = 0;
+	// Disable Macro Vote debug mode
+	voteDebugMode = 0;
+
+	// Disable Trigger Pending debug mode
+	triggerPendingDebugMode = 0;
+
+	// Make sure macro trigger event buffer is empty
+	macroTriggerEventBufferSize = 0;
 
 	// Set the current rotated layer to 0
 	Macro_rotationLayer = 0;
+
+	// Layer debug mode
+	layerDebugMode = 0;
 
 	// Setup Triggers
 	Trigger_setup();
 
 	// Setup Results
 	Result_setup();
+
+	// Allocate resource for latency measurement
+	macroLatencyResource = Latency_add_resource("PartialMap", LatencyOption_Ticks);
 }
 
 
@@ -1032,7 +1471,7 @@ void cliFunc_layerList( char* args )
 	info_msg("Layer List");
 
 	// Iterate through all of the layers and display them
-	for ( uint16_t layer = 0; layer < LayerNum; layer++ )
+	for ( index_uint_t layer = 0; layer < LayerNum; layer++ )
 	{
 		print( NL "\t" );
 		printHex( layer );
@@ -1106,8 +1545,35 @@ void cliFunc_layerState( char* args )
 
 void cliFunc_macroDebug( char* args )
 {
-	// Toggle macro debug mode
-	macroDebugMode = macroDebugMode ? 0 : 1;
+	// Parse number from argument
+	//  NOTE: Only first argument is used
+	char* arg1Ptr;
+	char* arg2Ptr;
+	CLI_argumentIsolation( args, &arg1Ptr, &arg2Ptr );
+
+	// Set the macro debug flag depending on the argument
+	switch ( arg1Ptr[0] )
+	{
+	// 3 as argument
+	case '3':
+		macroDebugMode = macroDebugMode != 3 ? 3 : 0;
+		break;
+
+	// 2 as argument
+	case '2':
+		macroDebugMode = macroDebugMode != 2 ? 2 : 0;
+		break;
+
+	// No argument
+	case '1':
+	case '\0':
+		macroDebugMode = macroDebugMode != 1 ? 1 : 0;
+		break;
+
+	// Invalid argument
+	default:
+		return;
+	}
 
 	print( NL );
 	info_msg("Macro Debug Mode: ");
@@ -1119,11 +1585,11 @@ void cliFunc_macroList( char* args )
 	// Show pending key events
 	print( NL );
 	info_msg("Pending Key Events: ");
-	printInt16( (uint16_t)macroTriggerListBufferSize );
+	printInt16( (uint16_t)macroTriggerEventBufferSize );
 	print(" : ");
-	for ( var_uint_t key = 0; key < macroTriggerListBufferSize; key++ )
+	for ( var_uint_t key = 0; key < macroTriggerEventBufferSize; key++ )
 	{
-		printHex( macroTriggerListBuffer[ key ].scanCode );
+		printHex( macroTriggerEventBuffer[ key ].index );
 		print(" ");
 	}
 
@@ -1239,6 +1705,8 @@ void macroDebugShowTrigger( var_uint_t index )
 	// Display current position
 	print( NL "Position: " );
 	printInt16( (uint16_t)record->pos ); // Hopefully large enough :P (can't assume 32-bit)
+	print(" ");
+	printInt16( (uint16_t)record->prevPos );
 
 	// Display result macro index
 	print( NL "Result Macro Index: " );
@@ -1248,9 +1716,10 @@ void macroDebugShowTrigger( var_uint_t index )
 	print( NL "Trigger Macro State: " );
 	switch ( record->state )
 	{
-	case TriggerMacro_Press:   print("Press");   break;
-	case TriggerMacro_Release: print("Release"); break;
-	case TriggerMacro_Waiting: print("Waiting"); break;
+	case TriggerMacro_Press:        print("Press");   break;
+	case TriggerMacro_Release:      print("Release"); break;
+	case TriggerMacro_PressRelease: print("Press|Release"); break;
+	case TriggerMacro_Waiting:      print("Waiting"); break;
 	}
 }
 
@@ -1333,6 +1802,8 @@ void macroDebugShowResult( var_uint_t index )
 	// Display current position
 	print( NL "Position: " );
 	printInt16( (uint16_t)record->pos ); // Hopefully large enough :P (can't assume 32-bit)
+	print(" ");
+	printInt16( (uint16_t)record->prevPos );
 
 	// Display final trigger state/type
 	print( NL "Final Trigger State (State/Type): " );
@@ -1422,5 +1893,32 @@ void cliFunc_posList( char* args )
 		print( NL );
 	}
 	*/
+}
+
+void cliFunc_voteDebug( char* args )
+{
+	// Parse number from argument
+	//  NOTE: Only first argument is used
+	char* arg1Ptr;
+	char* arg2Ptr;
+	CLI_argumentIsolation( args, &arg1Ptr, &arg2Ptr );
+
+	// Set the vote debug flag depending on the argument
+	switch ( arg1Ptr[0] )
+	{
+	// No argument
+	case 1:
+	case '\0':
+		voteDebugMode = voteDebugMode != 1 ? 1 : 0;
+		break;
+
+	// Invalid argument
+	default:
+		return;
+	}
+
+	print( NL );
+	info_msg("Vote Debug Mode: ");
+	printInt8( voteDebugMode );
 }
 

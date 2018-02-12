@@ -1,6 +1,6 @@
 ###| CMAKE Kiibohd Controller KLL Configurator |###
 #
-# Written by Jacob Alexander in 2014-2016 for the Kiibohd Controller
+# Written by Jacob Alexander in 2014-2018 for the Kiibohd Controller
 #
 # Released into the Public Domain
 #
@@ -19,13 +19,15 @@ if ( "${MacroModule}" STREQUAL "PartialMap" OR "${MacroModule}" STREQUAL "PixelM
 # Check disabled for Win32 as it can't detect version correctly (we don't use Python directly through CMake anyways)
 #
 
-if ( NOT CMAKE_HOST_WIN32 )
+set ( PYTHON_EXECUTABLE
+	python3
+	CACHE STRING "Python 3 Executable Path"
+)
+if ( NOT "${DETECTED_BUILD_KERNEL}" MATCHES "CYGWIN" )
 	# Required on systems where python is 2, not 3
-	set ( PYTHON_EXECUTABLE
-		python3
-		CACHE STRING "Python 3 Executable Path"
-	)
 	find_package ( PythonInterp 3 REQUIRED )
+else ()
+	message ( STATUS "Python Executable: ${PYTHON_EXECUTABLE}" )
 endif ()
 
 
@@ -33,7 +35,7 @@ endif ()
 # KLL Installation (Make sure repo has been cloned)
 #
 
-if ( NOT EXISTS "${PROJECT_SOURCE_DIR}/kll/kll.py" )
+if ( NOT EXISTS "${PROJECT_SOURCE_DIR}/kll/kll" )
 	message ( STATUS "Downloading latest kll version:" )
 
 	# Make sure git is available
@@ -66,8 +68,13 @@ foreach ( filename ${ScanModule_KLL} ${MacroModule_KLL} ${OutputModule_KLL} ${De
 	set ( KLL_DEPENDS ${KLL_DEPENDS} ${filename} )
 endforeach ()
 
+#| If this is a HostBuild, we're overriding the BaseMap directory to the original module
 #| If set BaseMap cannot be found, use default map
-set ( pathname "${PROJECT_SOURCE_DIR}/${ScanModulePath}" )
+if ( HostBuild )
+	set ( pathname "${PROJECT_SOURCE_DIR}/Scan/${ScanModule}" )
+else ()
+	set ( pathname "${PROJECT_SOURCE_DIR}/${ScanModulePath}" )
+endif ()
 
 string ( REPLACE " " ";" MAP_LIST ${BaseMap} ) # Change spaces to semicolons
 foreach ( MAP ${MAP_LIST} )
@@ -87,6 +94,10 @@ foreach ( MAP ${MAP_LIST} )
 		message ( FATAL " Could not find '${MAP}.kll' BaseMap in Scan module directory" )
 	endif ()
 endforeach ()
+if ( NOT "${BaseMap_Args}" STREQUAL "" )
+	# Prepend --base flag if there are BaseMap args
+	set ( BaseMap_Args --base ${BaseMap_Args} )
+endif ()
 
 #| Configure DefaultMap if specified
 if ( NOT "${DefaultMap}" STREQUAL "" )
@@ -107,6 +118,10 @@ if ( NOT "${DefaultMap}" STREQUAL "" )
 		endif ()
 	endforeach ()
 endif ()
+if ( NOT "${DefaultMap_Args}" STREQUAL "" )
+	# Prepend --default flag if there are DefaultMap args
+	set ( DefaultMap_Args --default ${DefaultMap_Args} )
+endif ()
 
 #| Configure PartialMaps if specified
 if ( NOT "${PartialMaps}" STREQUAL "" )
@@ -124,6 +139,9 @@ if ( NOT "${PartialMaps}" STREQUAL "" )
 			elseif ( EXISTS "${PROJECT_SOURCE_DIR}/kll/layouts/${MAP_PART}.kll" )
 				set ( PartialMap_Args ${PartialMap_Args} ${PROJECT_SOURCE_DIR}/kll/layouts/${MAP_PART}.kll )
 				set ( KLL_DEPENDS ${KLL_DEPENDS} ${PROJECT_SOURCE_DIR}/kll/layouts/${MAP_PART}.kll )
+			elseif ( EXISTS "${pathname}/${MAP_PART}.kll" )
+				set ( PartialMap_Args ${PartialMap_Args} ${pathname}/${MAP_PART}.kll )
+				set ( KLL_DEPENDS ${KLL_DEPENDS} ${pathname}/${MAP_PART}.kll )
 			elseif ( EXISTS "${pathname}/${MAP}.kll" )
 				set ( PartialMap_Args ${PartialMap_Args} ${pathname}/${MAP}.kll )
 				set ( KLL_DEPENDS ${KLL_DEPENDS} ${pathname}/${MAP}.kll )
@@ -156,16 +174,28 @@ set ( kll_outputname ${kll_keymap} ${kll_defs} ${kll_pixelmap} )
 
 #| KLL Version
 set ( kll_version_cmd
-	${PROJECT_SOURCE_DIR}/kll/kll
+	${PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/kll/kll
 	--version
 )
 
+#| KLL Configurator Options
+#|
+#| Applied when running a compilation using KiiConf
+#|
+if ( DEFINED CONFIGURATOR )
+	set ( ignore ${CONFIGURATOR} ) # Needs to be here to hide warning about CONFIGURATOR
+	set ( kll_configurator_options
+		--preprocessor-tmp-path ${PROJECT_BINARY_DIR}/tmp_kll
+	)
+endif ()
+
 #| KLL Cmd
 set ( kll_cmd
-	${PROJECT_SOURCE_DIR}/kll/kll
+	${PYTHON_EXECUTABLE} ${PROJECT_SOURCE_DIR}/kll/kll
+	--kiibohd-debug
 	--config ${Config_Args}
-	--base ${BaseMap_Args}
-	--default ${DefaultMap_Args}
+	${BaseMap_Args}
+	${DefaultMap_Args}
 	${PartialMap_Args}
 	--emitter ${kll_emitter}
 	--def-template ${PROJECT_SOURCE_DIR}/kll/templates/kiibohdDefs.h
@@ -174,11 +204,25 @@ set ( kll_cmd
 	--def-output ${kll_defs}
 	--map-output ${kll_keymap}
 	--pixel-output ${kll_pixelmap}
-	#--operation-organization-display
-	#--data-organization-display
-	#--data-finalization-debug
-	#--data-finalization-display
-	#--data-analysis-debug
+	${kll_configurator_options}
+)
+
+set ( kll_cmd_debug_options
+	--operation-organization-debug
+	--data-organization-debug
+	--data-finalization-debug
+	--data-analysis-debug
+)
+
+set ( kll_cmd_display_options
+	--operation-organization-display
+	--data-organization-display
+	--data-finalization-display
+	--data-analysis-display
+)
+
+set ( kll_cmd_final_display_options
+	--data-analysis-display
 )
 
 add_custom_command ( OUTPUT ${kll_outputname}
@@ -193,6 +237,41 @@ add_custom_target ( kll_regen
 	COMMAND ${kll_version_cmd}
 	COMMAND ${kll_cmd}
 	COMMENT "Re-generating KLL Layout"
+)
+
+#| KLL Regen Debug Target
+add_custom_target ( kll_debug
+	COMMAND ${kll_version_cmd}
+	COMMAND ${kll_cmd} ${kll_cmd_debug_options}
+	COMMENT "Re-generating KLL Layout in Debug Mode"
+)
+
+#| KLL Regen Display Target
+add_custom_target ( kll_display
+	COMMAND ${kll_version_cmd}
+	COMMAND ${kll_cmd} ${kll_cmd_display_options}
+	COMMENT "Re-generating KLL Layout in Display Mode"
+)
+
+#| KLL Regen Final Display Target
+add_custom_target ( kll_final_display
+	COMMAND ${kll_version_cmd}
+	COMMAND ${kll_cmd} ${kll_cmd_final_display_options}
+	COMMENT "Re-generating KLL Layout in Final Display Mode"
+)
+
+#| KLL Regen Token Debug
+add_custom_target ( kll_token
+	COMMAND ${kll_version_cmd}
+	COMMAND ${kll_cmd} --token-debug
+	COMMENT "Re-generating KLL Layout in Token Debug Mode"
+)
+
+#| KLL Regen Parser Debug
+add_custom_target ( kll_parser
+	COMMAND ${kll_version_cmd}
+	COMMAND ${kll_cmd} --parser-debug --parser-token-debug
+	COMMENT "Re-generating KLL Layout in Parser Debug Mode"
 )
 
 #| Append generated file to required sources so it becomes a dependency in the main build

@@ -1,6 +1,6 @@
 ###| CMAKE Kiibohd Controller Source Configurator |###
 #
-# Written by Jacob Alexander in 2011-2015 for the Kiibohd Controller
+# Written by Jacob Alexander in 2011-2018 for the Kiibohd Controller
 #
 # Released into the Public Domain
 #
@@ -14,6 +14,17 @@
 if ( APPLE )
 	string ( REPLACE "-Wl,-search_paths_first" "" CMAKE_C_LINK_FLAGS ${CMAKE_C_LINK_FLAGS} )
 	string ( REPLACE "-Wl,-search_paths_first" "" CMAKE_CXX_LINK_FLAGS ${CMAKE_CXX_LINK_FLAGS} )
+endif ()
+
+
+
+###
+# GCC versions less than 5 don't support -fdiagnostics-color=always
+#
+
+if ( CMAKE_C_COMPILER_VERSION VERSION_LESS "5" )
+	remove_definitions( "-fdiagnostics-color=always" )
+	string ( REPLACE "-fdiagnostics-color=always" "" LINKER_FLAGS ${LINKER_FLAGS} )
 endif ()
 
 
@@ -60,6 +71,20 @@ else ()
 endif ()
 
 
+#| Convert the .ELF Into a .bin
+if ( JLINK )
+	set( TARGET_BIN ${TARGET}.jlink.bin )
+	set(
+		TARGET_ADDRESS "0x0"
+		CACHE STRING "Firmware starting address"
+	)
+	add_custom_command( TARGET ${TARGET} POST_BUILD
+		COMMAND ${OBJ_COPY} ${BIN_FLAGS} ${TARGET_OUT} ${TARGET_BIN}
+		COMMENT "Create jlink bin file: ${TARGET_BIN}"
+	)
+endif ()
+
+
 #| Convert the .ELF into a .bin to load onto the McHCK
 #| Then sign using dfu-suffix (requries dfu-util)
 if ( DEFINED DFU )
@@ -67,18 +92,36 @@ if ( DEFINED DFU )
 	find_package ( DFUSuffix )
 
 	set( TARGET_BIN ${TARGET}.dfu.bin )
+	set( TARGET_SECURE_BIN ${TARGET}.secure.dfu.bin )
 	if ( DFU_SUFFIX_FOUND )
 		add_custom_command( TARGET ${TARGET} POST_BUILD
 			COMMAND ${OBJ_COPY} ${BIN_FLAGS} ${TARGET_OUT} ${TARGET_BIN}
 			COMMAND ${DFU_SUFFIX_EXECUTABLE} --add ${TARGET_BIN} --vid ${BOOT_VENDOR_ID} --pid ${BOOT_PRODUCT_ID} 1> /dev/null
-			COMMENT "Create and sign dfu bin file:  ${TARGET_BIN}"
+			COMMENT "Create and sign dfu bin file: ${TARGET_BIN}"
 		)
+		# XXX (HaaTa) prependKey disabled currently for sam and nrf5 MCUs
+		if ( NOT "${CHIP_SUPPORT}" STREQUAL "sam" AND NOT "${CHIP_SUPPORT}" STREQUAL "nrf5"  )
+			add_custom_command( TARGET ${TARGET} POST_BUILD
+				COMMAND ${OBJ_COPY} ${BIN_FLAGS} ${TARGET_OUT} ${TARGET_SECURE_BIN}
+				COMMAND ${CMAKE_SOURCE_DIR}/Lib/CMake/prependKey ${TARGET_SECURE_BIN}
+				COMMAND ${DFU_SUFFIX_EXECUTABLE} --add ${TARGET_SECURE_BIN} --vid ${BOOT_VENDOR_ID} --pid ${BOOT_PRODUCT_ID} 1> /dev/null
+				COMMENT "Create and sign secure dfu bin file: ${TARGET_SECURE_BIN}"
+			)
+		endif ()
 	else ()
 		message ( WARNING "DFU Binary has not been signed, requires dfu-suffix..." )
 		add_custom_command( TARGET ${TARGET} POST_BUILD
 			COMMAND ${OBJ_COPY} ${BIN_FLAGS} ${TARGET_OUT} ${TARGET_BIN}
-			COMMENT "Creating dfu binary file:      ${TARGET_BIN}"
+			COMMENT "Creating dfu binary file: ${TARGET_BIN}"
 		)
+		# XXX (HaaTa) prependKey disabled currently for sam and nrf5 MCUs
+		if ( NOT "${CHIP_SUPPORT}" STREQUAL "sam" AND NOT "${CHIP_SUPPORT}" STREQUAL "nrf5" )
+			add_custom_command( TARGET ${TARGET} POST_BUILD
+				COMMAND ${OBJ_COPY} ${BIN_FLAGS} ${TARGET_OUT} ${TARGET_SECURE_BIN}
+				COMMAND ${CMAKE_SOURCE_DIR}/Lib/CMake/prependKey ${TARGET_SECURE_BIN}
+				COMMENT "Creating secure dfu binary file: ${TARGET_BIN}"
+			)
+		endif ()
 	endif ()
 endif ()
 
@@ -121,13 +164,22 @@ add_custom_command( TARGET ${TARGET} POST_BUILD
 #
 
 if ( NOT DEFINED HOST )
-	#| After Changes Size Information
+	# After Changes Size Information
 	add_custom_target( SizeAfter ALL
 		COMMAND ${CMAKE_SOURCE_DIR}/Lib/CMake/sizeCalculator ${CMAKE_SIZE} ram   ${TARGET_OUT} ${SIZE_RAM}   " SRAM"
 		COMMAND ${CMAKE_SOURCE_DIR}/Lib/CMake/sizeCalculator ${CMAKE_SIZE} flash ${TARGET_OUT} ${SIZE_FLASH} "Flash"
 		DEPENDS ${TARGET}
 		COMMENT "Chip usage for ${CHIP}"
 	)
+
+	# DFU Specific message
+	if ( DEFINED DFU )
+		add_custom_target( DFUMessage ALL
+			COMMAND ${CMAKE_SOURCE_DIR}/Lib/CMake/dfuMessage ${TARGET}
+			DEPENDS ${TARGET}
+			COMMENT "Message for DFU targets"
+		)
+	endif ()
 endif ()
 
 
@@ -136,11 +188,16 @@ endif ()
 # Setup Loader Script and Program
 #
 
-#| First check for DFU based controllers
-if( DEFINED DFU )
+#| First check for JLink based dev kits
+if ( JLINK )
+	configure_file( LoadFile/load.jlink load NEWLINE_STYLE UNIX )
+	configure_file( LoadFile/debug.jlink debug NEWLINE_STYLE UNIX )
+
+#| Next check for DFU based controllers
+elseif( DEFINED DFU )
 	configure_file( LoadFile/load.dfu load NEWLINE_STYLE UNIX )
 
-#| Next check for Teensy based
+#| Finally check for Teensy based
 elseif ( DEFINED TEENSY )
 	# Provides the user with the correct teensy-loader-cli command for the built .HEX file
 	# Windows
